@@ -1,1 +1,328 @@
 
+
+# 1. Imports & Setup (Same as before)
+# -------------------------------------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import AutoModel, AutoTokenizer
+from tqdm import tqdm
+import os
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.manual_seed(42)
+
+TRAIN_PATH = "/content/train_chn.csv"
+VAL_PATH   = "/content/dev_chn.csv"
+TEST_PATH  = "/content/test_chn.csv"
+
+train_df = pd.read_csv(TRAIN_PATH)
+val_df   = pd.read_csv(VAL_PATH)
+test_df  = pd.read_csv(TEST_PATH)
+
+# Instead of a single LABEL_VAR, define multiple label columns:
+LABEL_COLS = ["anger", "disgust", "fear", "joy", "sadness", "surprise"]
+TEXT_VAR   = "text"
+
+train_df.head()
+
+# 3. Load Tokenizer & Model for Embedding Extraction
+# -------------------------------------------------------
+model_name_1 = "jjlmsy/bert-base-chinese-finetuned-emotion"
+model_name_2 = "Johnson8187/Chinese-Emotion-Small"
+
+text_tokenizer_1 = AutoTokenizer.from_pretrained(model_name_1)
+text_model_1 = AutoModel.from_pretrained(model_name_1).to(device)
+
+text_tokenizer_2 = AutoTokenizer.from_pretrained(model_name_2)
+text_model_2 = AutoModel.from_pretrained(model_name_2).to(device)
+
+# Set up the plotting area (adjust size as needed)
+plt.figure(figsize=(12, 10))
+
+# Plot each categorical column's value counts
+# Changed 'few_category_columns' to 'LABEL_COLS'
+# Changed 'df' to 'train_df'
+for i, col in enumerate(LABEL_COLS):
+    plt.subplot(3, 3, i+1)  # Adjust grid size (3x3 here)
+    sns.countplot(x=col, data=train_df, palette='Set2')
+    plt.title(f'Value Counts for {col}') # Changed title for better clarity
+    plt.xticks(rotation=45)
+
+# Tight layout for better spacing
+plt.tight_layout()
+plt.show()
+
+def extract_multi_model_embeddings(df, save_path,
+                                   model1, tokenizer1,
+                                   model2, tokenizer2,
+                                   max_length=256):
+    """Extract embeddings from TWO transformer models, then concatenate."""
+    if os.path.exists(save_path):
+        print(f"Embeddings already exist at {save_path}")
+        return torch.load(save_path)
+
+    embeddings = {}
+    model1.eval()
+    model2.eval()
+
+    with torch.no_grad():
+        for idx, row in tqdm(df.iterrows(), desc="Extracting text embeddings", total=len(df)):
+            text_sample = row[TEXT_VAR] if isinstance(row[TEXT_VAR], str) else ""
+
+            # Model 1
+            inputs_1 = tokenizer1(text_sample, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt").to(device)
+            outputs_1 = model1(**inputs_1)
+            cls_1 = outputs_1.last_hidden_state[:, 0, :]  # shape: (1, 768)
+
+            # Model 2
+            inputs_2 = tokenizer2(text_sample, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt").to(device)
+            outputs_2 = model2(**inputs_2)
+            cls_2 = outputs_2.last_hidden_state[:, 0, :]  # shape: (1, 768)
+
+            # Concatenate Embeddings
+            combined = torch.cat((cls_1, cls_2), dim=1)  # shape: (1, 1536)
+            embeddings[idx] = combined.cpu()
+
+    torch.save(embeddings, save_path)
+    return embeddings
+
+train_text_embeddings = extract_multi_model_embeddings(train_df, "train_text_embeddings.pt", text_model_1, text_tokenizer_1, text_model_2, text_tokenizer_2)
+val_text_embeddings   = extract_multi_model_embeddings(val_df, "val_text_embeddings.pt", text_model_1, text_tokenizer_1, text_model_2, text_tokenizer_2)
+test_text_embeddings  = extract_multi_model_embeddings(test_df, "test_text_embeddings.pt", text_model_1, text_tokenizer_1, text_model_2, text_tokenizer_2)
+
+# 5. Prepare Embeddings (CHANGED for Multi‐Label)
+# -------------------------------------------------------
+def prepare_text_embeddings(text_embeddings, df, label_cols=None, has_labels=True):
+    """For each row in df, gather the text embedding and (optionally) the labels."""
+    combined_embeddings = []
+    labels = []
+
+    for idx, row in df.iterrows():
+        if idx not in text_embeddings:
+            continue
+        text_embedding = text_embeddings[idx].squeeze()
+        combined_embeddings.append(text_embedding)
+
+        if has_labels and label_cols is not None:
+            label_vector = row[label_cols].values.astype(int)
+            labels.append(label_vector)
+
+    if has_labels and label_cols is not None:
+        X = torch.stack(combined_embeddings)
+        Y = torch.tensor(labels, dtype=torch.long)
+        return X, Y
+    else:
+        return torch.stack(combined_embeddings)
+
+X_train, y_train = prepare_text_embeddings(train_text_embeddings, train_df, LABEL_COLS, has_labels=True)
+X_val, y_val = prepare_text_embeddings(val_text_embeddings, val_df, LABEL_COLS, has_labels=True)
+X_test = prepare_text_embeddings(test_text_embeddings, test_df, LABEL_COLS, has_labels=False)
+
+
+
+class MLPModel(nn.Module):
+    """Multi-Label Multi-Class MLP Model"""
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout_p=0.5):
+        super(MLPModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim[0])
+        self.relu = nn.ReLU()
+        self.dropout1 = nn.Dropout(p=dropout_p)
+        self.fc2 = nn.Linear(hidden_dim[0], hidden_dim[1])
+        self.dropout2 = nn.Dropout(p=dropout_p)
+        self.fc3 = nn.Linear(hidden_dim[1], output_dim)
+        self.sigmoid = nn.Sigmoid()
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.dropout1(x)
+        x = self.relu(self.fc2(x))
+        x = self.dropout2(x)
+        x = self.fc3(x)  # Output shape: (batch_size, 6 * 4)
+        return x.view(-1, 6, 4)  # Reshape to (batch_size, 6, 4)
+
+# Model & Hyperparams
+input_dim = 1536  # Combined Transformer Embeddings (768 + 768)
+hidden_dim = [2048, 1024]
+output_dim = 6 * 4  # 6 labels × 4 intensity levels
+dropout_p = 0.5
+model = MLPModel(input_dim, hidden_dim, output_dim, dropout_p).to(device)
+
+class MultiLabelMultiClassLoss(nn.Module):
+    """Custom loss using CrossEntropyLoss for each label."""
+    def __init__(self, num_labels=6, num_classes=4):
+        super().__init__()
+        self.num_labels = num_labels
+        self.num_classes = num_classes
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, logits, targets):
+        batch_size = logits.size(0)
+        total_loss = sum(self.ce(logits[:, i, :], targets[:, i]) for i in range(self.num_labels))
+        return total_loss / self.num_labels
+
+criterion = MultiLabelMultiClassLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+
+# >>> LR DECAY CODE: Define a scheduler after creating optimizer <<<
+#>>>from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+#scheduler = ReduceLROnPlateau(
+   # optimizer,
+  #  mode='min',    # We want to reduce LR if val_loss does not improve
+  #  factor=0.5,    # Reduce the LR by half
+   # patience=3,    # Number of epochs with no improvement before reducing
+   # verbose=True)
+# >>> LR DECAY CODE ENDS <<<
+
+# 8. Dataloaders
+# -------------------------------------------------------
+train_dataset = TensorDataset(X_train, y_train)
+val_dataset   = TensorDataset(X_val,   y_val)
+test_dataset  = TensorDataset(X_test)  # no labels for test
+
+# 8. Dataloaders
+# -------------------------------------------------------
+train_dataset = TensorDataset(X_train, y_train)
+val_dataset   = TensorDataset(X_val,   y_val)
+test_dataset  = TensorDataset(X_test)  # no labels for test
+
+train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=32, shuffle=True)
+val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=32)
+test_loader  = DataLoader(test_dataset,  batch_size=32)
+
+def calculate_metrics(logits_list, labels_list):
+    """Calculate macro precision, recall, F1, and accuracy."""
+    all_logits = torch.cat(logits_list, dim=0)
+    all_labels = torch.cat(labels_list, dim=0)
+
+    N = all_logits.size(0)
+    all_logits = all_logits.view(N, 6, 4)
+    preds = torch.argmax(all_logits, dim=2)
+
+    preds_flat = preds.view(-1).cpu().numpy()
+    labels_flat = all_labels.view(-1).cpu().numpy()
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels_flat, preds_flat, average="macro", zero_division=0
+    )
+    accuracy = (preds_flat == labels_flat).mean()
+
+    return accuracy, precision, recall, f1
+
+def train_and_save_best_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, save_dir):
+    best_f1 = -float("inf")
+    best_model_path = None
+
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+        logits_list_train, labels_list_train = [], []
+
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            logits_list_train.append(outputs.detach())
+            labels_list_train.append(labels.detach())
+
+        train_accuracy, train_precision, train_recall, train_f1 = calculate_metrics(logits_list_train, labels_list_train)
+        train_loss /= len(train_loader)
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        logits_list_val, labels_list_val = [], []
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                logits_list_val.append(outputs)
+                labels_list_val.append(labels)
+
+        val_accuracy, val_precision, val_recall, val_f1 = calculate_metrics(logits_list_val, labels_list_val)
+        val_loss /= len(val_loader)
+
+        print(
+            f"Epoch {epoch+1}/{num_epochs} "
+            f"Train Loss: {train_loss:.4f}, Acc: {train_accuracy:.4f}, F1: {train_f1:.4f} | "
+            f"Val Loss: {val_loss:.4f}, Acc: {val_accuracy:.4f}, F1: {val_f1:.4f}"
+        )
+
+        # Save best model
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_model_path = os.path.join(save_dir, f"best_model_epoch_{epoch+1}_f1_{val_f1:.4f}.pth")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Best model saved with F1: {val_f1:.4f} at epoch {epoch+1}")
+
+    return best_model_path
+
+save_dir = "./models"
+os.makedirs(save_dir, exist_ok=True)
+
+best_model_path = train_and_save_best_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, save_dir=save_dir)
+
+print(f"Best model saved at: {best_model_path}")
+
+def predict_and_generate_submission(test_loader, best_model_path, submission_file_path):
+    inference_model = MLPModel(input_dim, hidden_dim, output_dim, dropout_p).to(device)
+    inference_model.load_state_dict(torch.load(best_model_path))
+    inference_model.eval()
+
+    test_predictions = []
+    with torch.no_grad():
+        for (inputs,) in test_loader:
+            inputs = inputs.to(device)
+            outputs = inference_model(inputs)
+            batch_size = outputs.size(0)
+            outputs = outputs.view(batch_size, 6, 4)
+            preds = torch.argmax(outputs, dim=2)
+            test_predictions.append(preds.cpu())
+
+    test_predictions = torch.cat(test_predictions, dim=0).numpy()
+
+    submission_df = pd.DataFrame({
+        "id": test_df["id"],
+        "anger": test_predictions[:, 0],
+        "disgust": test_predictions[:, 1],
+        "fear": test_predictions[:, 2],
+        "joy": test_predictions[:, 3],
+        "sadness": test_predictions[:, 4],
+        "surprise": test_predictions[:, 5]
+    })
+
+    submission_df.to_csv(submission_file_path, index=False)
+    print(f"Submission file saved to {submission_file_path}")
+    return submission_df
+
+submission_file_path = "submission.csv"
+submission_df = predict_and_generate_submission(test_loader, best_model_path, submission_file_path)
+submission_df.head()
+
+
+
+
+
+
